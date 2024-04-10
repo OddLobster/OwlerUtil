@@ -7,6 +7,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import umap.umap_ as umap
 import seaborn as sns
+import time
+import random
+import hashlib
 
 from sklearn.manifold import TSNE
 from numpy.linalg import norm
@@ -19,14 +22,17 @@ from string import punctuation
 from scipy.spatial import distance
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity, euclidean_distances
-from transformers import BertTokenizer, BertModel, BertForSequenceClassification
+from transformers import BertTokenizer, BertModel, BertForSequenceClassification, AdamW
 from sklearn.neighbors import NearestNeighbors
 from sentence_transformers import SentenceTransformer
 from boilerpy3 import extractors
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.patches import Circle
-
-
+from torch.utils.data import DataLoader, TensorDataset, random_split
+from sklearn.svm import OneClassSVM
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn import linear_model
+from sklearn.ensemble import IsolationForest
 
 
 DIMENSIONS = 300
@@ -57,6 +63,34 @@ max_url_length = max(len(url) for url in all_urls)
 bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 bert_model = BertModel.from_pretrained('bert-base-uncased')
 bert_model.eval()
+
+tfidf_vectorizer = TfidfVectorizer(max_df=0.8, min_df=0.05)
+
+def get_tfidf_of_corpus():
+    abstracts = process_documents_tfidf(filter_abstracts(return_abstracts=True))
+    corpus_tfidf = tfidf_vectorizer.fit_transform(abstracts)
+    return corpus_tfidf
+
+def get_tokens_from_website(url, process_text=True, relevant=True, save=True):
+    # res = requests.get(url)
+    # soup = BeautifulSoup(res.text, "html.parser")
+    # text = soup.get_text(separator="\n", strip=True)
+    text = ""
+    try:
+        extractor = extractors.ArticleExtractor()
+        text = extractor.get_content_from_url(url)
+        if process_text:
+            processed_text = process_documents_combined([text])
+            return processed_text
+    except:
+        pass
+    
+    if save:
+        filename = "relevant_text.txt" if relevant else "irrelevant_text.txt"
+        with open(filename, "a+") as file:
+            file.write(text.strip().replace("\n", " ").replace("\r", " ").replace("\t", " ") + "\n")
+
+    return text
 
 
 def get_texts(relevant=True):
@@ -183,7 +217,6 @@ def create_mean_embedding(glove_embeddings=None):
         file.write("combined ")
         combined_embedding.tofile(file, sep=" ")
 
-
 def create_multiple_embeddings(glove_embeddings=None):
     if glove_embeddings is None:
         print("Loading GloVe embeddings")
@@ -195,6 +228,7 @@ def create_multiple_embeddings(glove_embeddings=None):
     print("Creating document embedding")
     embeddings = calc_multiple_embeddings_from_tokens(glove_embeddings, processed_abstracts)
     np.save("data/multiple_embeddings.npy", embeddings)
+
 
 
 def calc_similarity(corpus_embedding, document_embedding, mode=EUCLIDEAN):
@@ -219,26 +253,6 @@ def get_embeddings(name=""):
     else:
         return embeddings
 
-def get_tokens_from_website(url, process_text=True, relevant=True, save=True):
-    # res = requests.get(url)
-    # soup = BeautifulSoup(res.text, "html.parser")
-    # text = soup.get_text(separator="\n", strip=True)
-    text = ""
-    try:
-        extractor = extractors.ArticleExtractor()
-        text = extractor.get_content_from_url(url)
-        if process_text:
-            processed_text = process_documents_combined([text])
-            return processed_text
-    except:
-        pass
-    
-    if save:
-        filename = "relevant_text.txt" if relevant else "irrelevant_text.txt"
-        with open(filename, "a+") as file:
-            file.write(text.strip().replace("\n", " ").replace("\r", " ").replace("\t", " ") + "\n")
-
-    return text
 
 def test_mean_embedding(glove_embeddings):
     create_mean_embedding(glove_embeddings)
@@ -334,11 +348,35 @@ def test_tfidf_baseline_embedding():
         # print(f"  Mean Similarity between  {url.ljust(max_url_length)} and corpus is: {np.mean(similarity):.4f}")
         print(f"  Max Similarity between   {url.ljust(max_url_length)} and corpus is: {np.max(similarity):.4f}")
 
-def get_bert_text_embedding(document):
-    inputs = bert_tokenizer(document, return_tensors='pt', truncation=True, max_length=512, padding="max_length")
-    outputs = bert_model(**inputs)
-    embeddings = outputs.last_hidden_state.mean(1)
-    return embeddings
+# def get_bert_text_embedding(document):
+#     inputs = bert_tokenizer(document, return_tensors='pt', truncation=True, max_length=512, padding="max_length")
+#     outputs = bert_model(**inputs)
+#     embeddings = outputs.last_hidden_state.mean(1)
+#     return embeddings
+        
+def get_bert_text_embedding(document, cache_file="data/bert_embeddings_cache.json"):
+    doc_hash = hashlib.sha256(document.encode('utf-8')).hexdigest()
+    
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            cache = json.load(f)
+    else:
+        cache = {}
+
+    if doc_hash in cache:
+        cached_embedding = torch.tensor(cache[doc_hash])
+        return cached_embedding
+    else:
+        inputs = bert_tokenizer(document, return_tensors='pt', truncation=True, max_length=512, padding="max_length")
+        outputs = bert_model(**inputs)
+        embeddings = outputs.last_hidden_state.mean(1)
+        
+        with open(cache_file, 'w') as f:
+            cache[doc_hash] = embeddings.detach().numpy().tolist()
+            json.dump(cache, f)
+        
+        return embeddings
+    
 
 def get_bert_embeddings(embedding_file=None, abstracts=None):
 
@@ -358,32 +396,43 @@ def get_bert_embeddings(embedding_file=None, abstracts=None):
 def test_bert_embedding(corpus_embedding, distance_function=cosine_similarity, plot=True):
     irrelevant_embeddings = []
     relevant_embeddings = []
+    relevant_sims = []
+    irrelevant_sims = []
+    relevant_texts = get_texts(relevant=True)[:10]
+
+
+
     print("Testing relevant URLs")
-    for url in relevant_urls:
-        text = get_tokens_from_website(url, process_text=False, relevant=True, save=True)
+    for i, text in enumerate(relevant_texts):
         text_embedding = get_bert_text_embedding(text)
         relevant_embeddings.append(text_embedding.detach().numpy())
         similarities = distance_function(corpus_embedding, text_embedding.detach().numpy()).flatten()
         sorted_similarities = np.sort(similarities)[::-1]
-        print(f"  Mean Similarity between  {url.ljust(max_url_length)} and corpus is: Mean {np.mean(similarities):.4f}")
-        print(f"  Max Similarity between   {url.ljust(max_url_length)} and corpus is: Max  {np.max(similarities):.4f}")
-        print(f"  min Similarity between   {url.ljust(max_url_length)} and corpus is: Min  {np.min(similarities):.4f}")
-        print(f"  Top 5 mean between       {url.ljust(max_url_length)} and corpus is: TopK {np.mean(sorted_similarities[::-1][:5]):.4f}")
-        print("--")
+        # print(f"  Mean Similarity between  {relevant_urls[i].ljust(max_url_length)} and corpus is: Mean {np.mean(similarities):.4f}")
+        # print(f"  Max Similarity between   {relevant_urls[i].ljust(max_url_length)} and corpus is: Max  {np.max(similarities):.4f}")
+        # print(f"  min Similarity between   {relevant_urls[i].ljust(max_url_length)} and corpus is: Min  {np.min(similarities):.4f}")
+        print(f"  Top 5 mean between       {relevant_urls[i].ljust(max_url_length)} and corpus is: TopK {np.mean(sorted_similarities[::-1][:5]):.4f}")
+        relevant_sims.append(np.mean(sorted_similarities[::-1][:5]))
     print("#"*25)
 
     print("Testing irrelevant URLs")
-    for url in irrelevant_urls:
-        text = get_tokens_from_website(url, process_text=False, relevant=False, save=True)
+    irrelevant_texts = get_texts(relevant=False)[:10]
+    for i, text in enumerate(irrelevant_texts):
         text_embedding = get_bert_text_embedding(text)
         irrelevant_embeddings.append(text_embedding.detach().numpy())
         similarities = distance_function(corpus_embedding, text_embedding.detach().numpy()).flatten()
         sorted_similarities = np.sort(similarities)[::-1]
-        print(f"  Mean Similarity between  {url.ljust(max_url_length)} and corpus is: Mean {np.mean(similarities):.4f}")
-        print(f"  Max Similarity between   {url.ljust(max_url_length)} and corpus is: Max  {np.max(similarities):.4f}")
-        print(f"  min Similarity between   {url.ljust(max_url_length)} and corpus is: Min  {np.min(similarities):.4f}")
-        print(f"  Top 5 mean between       {url.ljust(max_url_length)} and corpus is: TopK {np.mean(sorted_similarities[::-1][:5]):.4f}")
-        print("--")
+        # print(f"  Mean Similarity between  {irrelevant_urls[i].ljust(max_url_length)} and corpus is: Mean {np.mean(similarities):.4f}")
+        # print(f"  Max Similarity between   {irrelevant_urls[i].ljust(max_url_length)} and corpus is: Max  {np.max(similarities):.4f}")
+        # print(f"  min Similarity between   {irrelevant_urls[i].ljust(max_url_length)} and corpus is: Min  {np.min(similarities):.4f}")
+        print(f"  Top 5 mean between       {irrelevant_urls[i].ljust(max_url_length)} and corpus is: TopK {np.mean(sorted_similarities[::-1][:5]):.4f}")
+        irrelevant_sims.append(np.mean(sorted_similarities[::-1][:5]))
+
+    print("Mean total relevant sims: ", np.array(relevant_sims).mean())
+    print("Mean total irrelevant sims: ", np.array(irrelevant_sims).mean())
+    print("Median total relevant sims: ", np.median(relevant_sims))
+    print("Median total irrelevant sims: ", np.median(irrelevant_sims))
+
 
     if plot:
         reducer = umap.UMAP(random_state=42)
@@ -414,11 +463,11 @@ def test_bert_embedding_knn(corpus_embedding, num_neighbors=5, plot=True):
 
 
     print("Testing relevant URLs")
-    for url in relevant_urls:
-        text = get_tokens_from_website(url, process_text=False)
+    relevant_texts = get_texts(relevant=True)[:10]
+    for i, text in enumerate(relevant_texts):        
         text_embedding = get_bert_text_embedding(text).detach().numpy()
         distances, indices = knn.kneighbors(text_embedding, n_neighbors=num_neighbors)
-        print(f"  URL: {url}")
+        print(f"  URL: {relevant_urls[i]}")
         print(f"  Closest Neighbor: Document {indices[0][0]} at distance: {distances[0][0]:.4f}")
         print(f"  Mean Distance to Top {num_neighbors} Neighbors:         {distances[0].mean():.4f}")
         # mean_neighbor_embedding = corpus_embedding[indices[0]].mean(axis=0)
@@ -429,16 +478,14 @@ def test_bert_embedding_knn(corpus_embedding, num_neighbors=5, plot=True):
             plt.scatter(text_embedding[0, 0], text_embedding[0, 1], color='blue', label='Relevant')
             plt.scatter(corpus_embedding[indices[0]][:, 0], corpus_embedding[indices[0]][:, 1], color='blue', alpha=0.5)
             
-            # circle = Circle((text_embedding[0, 0], text_embedding[0, 1]), np.mean(distances[0]), fill=False, color='blue', linestyle='--')
-            # plt.gca().add_patch(circle)
 
     print("#"*25)
     print("Testing irrelevant URLs")
-    for url in irrelevant_urls:
-        text = get_tokens_from_website(url, process_text=False)
+    irrelevant_texts = get_texts(relevant=False)[:10]
+    for i, text in enumerate(irrelevant_texts):
         text_embedding = get_bert_text_embedding(text).detach().numpy()
         distances, indices = knn.kneighbors(text_embedding, n_neighbors=num_neighbors)
-        print(f"  URL: {url}")
+        print(f"  URL: {irrelevant_urls[i]}")
         print(f"  Closest Neighbor: Abstract {indices[0][0]} at distance: {distances[0][0]:.4f}")
         print(f"  Mean Distance to Top {num_neighbors} Neighbors:         {distances[0].mean():.4f}")
         # mean_neighbor_embedding = corpus_embedding[indices[0]].mean(axis=0)
@@ -449,9 +496,6 @@ def test_bert_embedding_knn(corpus_embedding, num_neighbors=5, plot=True):
             plt.scatter(text_embedding[0, 0], text_embedding[0, 1], color='red', label='Irrelevant')
             plt.scatter(corpus_embedding[indices[0]][:, 0], corpus_embedding[indices[0]][:, 1], color='red', alpha=0.5)
             
-            # Draw circle around the irrelevant URL and its neighbors
-            # circle = Circle((text_embedding[0, 0], text_embedding[0, 1]), np.mean(distances[0]), fill=False, color='red', linestyle='--')
-            # plt.gca().add_patch(circle)
 
     if plot:
         plt.xlabel('Dimension 1')
@@ -533,46 +577,6 @@ def test_bert_classification():
         print(f"Epoch {epoch} loss: {total_loss / len(train_dataloader)}")
 
 
-def sbert():
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-    abstracts = get_abstracts("data/raw_paper_abstracts.json", num_abstracts=10)
-    spacy_model = spacy.load("en_core_web_sm")
-
-    abstract_embeddings = []
-    for abstract in tqdm(abstracts):
-        doc = spacy_model(abstract)
-        sentences = [s.text for s in doc.sents]
-        s_embeddings = model.encode(sentences)
-        abstract_embeddings.append(np.mean(s_embeddings))
-
-    print("Testing relevant URLs")
-    for url in relevant_urls:
-        text = " ".join(get_tokens_from_website(url, process_text=False))
-
-        doc = spacy_model(text)
-        sentences = [s.text for s in doc.sents]
-        s_embeddings = model.encode(sentences)
-        # s_embeddings_mean = np.mean(s_embeddings, axis=0).reshape(1, -1)
-
-        similarities = cosine_similarity(abstract_embeddings, s_embeddings)
-        print(f"  Mean Similarity between  of top k neighbors and corpus is: {np.mean(similarities):.4f}")
-        print(f"  Max Similarity between   of top k neighbors and corpus is: {np.max(similarities):.4f}")
-        # print(f"  Sum Similarities between of top k neighbors and corpus is: {np.sum(similarities):.4f}")
-
-    print("#"*25)
-    print("Testing irrelevant URLs")
-    for url in irrelevant_urls:
-        text = " ".join(get_tokens_from_website(url, process_text=False))
-
-        doc = spacy_model(text)
-        sentences = [s.text for s in doc.sents]
-        s_embeddings = model.encode(sentences)
-
-        similarities = cosine_similarity(abstract_embeddings, s_embeddings)
-        print(f"  Mean Similarity between  of top k neighbors and corpus is: {np.mean(similarities):.4f}")
-        print(f"  Max Similarity between   of top k neighbors and corpus is: {np.max(similarities):.4f}")
-        # print(f"  Sum Similarities between of top k neighbors and corpus is: {np.sum(similarities):.4f}")
-
 def analyze_reference_corpus(embedding_file="", title=""):
     if not embedding_file:
         embeddings = np.load("data/bert_embeddings.npy")
@@ -644,21 +648,198 @@ def analyze_reference_corpus(embedding_file="", title=""):
     ax.set_title('3D UMAP Visualization of BERT Embeddings')
     plt.savefig(f'figures/3d_umap_bert_embeddings{title}.png', dpi=300)
 
-
 def filter_abstracts(return_abstracts=False):
     abstracts = get_abstracts("data/raw_paper_abstracts.json")
+    #FIXME use bert embeddings ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     embeddings = np.load("data/multiple_embeddings.npy")
     similarity_matrix = cosine_similarity(embeddings)
 
     similarity_threshold = 0.5
     row_sim = np.mean(similarity_matrix, axis=0)
     indices_to_keep = np.where(row_sim > similarity_threshold)[0]
-
     filtered_abstracts = [abstracts[i] for i in indices_to_keep]
     if return_abstracts:
         return filtered_abstracts
     get_bert_embeddings("data/filtered_bert_embeddings.npy", filtered_abstracts)
 
+def calc_similarities_glove(glove_embedding, corpus_embeddings, text):
+    text_embedding = calc_embedding_from_tokens(glove_embedding, process_documents_combined([text]))
+    similarities = []
+    for embedding in corpus_embeddings:
+        similarity = calc_similarity(embedding, list(text_embedding), mode=COSINE)
+        similarities.append(similarity)
+    sorted_similarities = np.sort(similarities)[::-1]
+    return sorted_similarities
+
+def calc_similarities_bert(glove_embedding, corpus_embedding, text):
+    text_embedding = get_bert_text_embedding(text)
+    similarities = euclidean_distances(corpus_embedding, text_embedding.detach().numpy()).flatten()
+    sorted_similarities = np.sort(similarities)
+    return sorted_similarities
+
+def calc_similarities_tfidf(glove_embedding, corpus_tfidf, text):
+    document_tfidf = tfidf_vectorizer.transform([text])
+    similarities = euclidean_distances(corpus_tfidf, document_tfidf).flatten()
+    sorted_similarities = np.sort(similarities)[::-1]
+    return sorted_similarities
+
+def test_precision_threshold(corpus_embedding, similarity_func=None, glove_embedding=None):
+    reference_corpus = filter_abstracts(return_abstracts=True)
+    relevant_texts = get_texts(relevant=True)
+    irrelevant_texts = get_texts(relevant=False)
+    num_relevant = len(relevant_texts)
+    num_irrelevant = len(irrelevant_texts)
+
+    document_urls = relevant_urls + irrelevant_urls
+    documents = relevant_texts + irrelevant_texts
+    combined = list(zip(documents, document_urls))
+    random.shuffle(combined)
+
+    documents, document_urls = zip(*combined)
+
+    relevant_threshold_set = random.sample(reference_corpus, int(len(reference_corpus)*0.2))
+    sims_5 = []
+    sims_25 = []
+    sims_high = []
+    sims_low = []
+    sims = []
+
+    top_5 = int(len(reference_corpus)*0.05)
+    top_25 = int(len(reference_corpus)*0.25)
+
+    print("Determining relevance threshold")
+    for i, text in tqdm(enumerate(relevant_threshold_set)):
+        sorted_similarities = similarity_func(glove_embedding, corpus_embedding, text)
+        sims_5.append(np.mean(sorted_similarities[:top_5]))
+        sims_25.append(np.mean(sorted_similarities[:top_25]))
+        sims_high.append(sorted_similarities[-1])
+        sims_low.append(sorted_similarities[0])
+        sims.extend(sorted_similarities)
+
+    relevant_threshold_mean_5 = np.array(sims_5).mean()
+    relevant_threshold_mean_25 = np.array(sims_25).mean()
+    relevant_threshold_median_5 = np.median(sims_5)
+    relevant_threshold_median_25 = np.median(sims_25)
+    relevant_threshold_total_mean = np.array(sims).mean()
+    relevant_threshold_total_median = np.median(sims)
+
+    print("Thresholds:")
+    print("Mean_5:", relevant_threshold_mean_5)
+    print("Mean_25:", relevant_threshold_mean_25)
+    print("Median_5:", relevant_threshold_median_5)
+    print("Median_25:", relevant_threshold_median_25)
+    print("Mean_total:", relevant_threshold_total_mean)
+    print("Median_total:", relevant_threshold_total_median)
+
+    performance_stats = {
+        'mean_5': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_mean_5},
+        'mean_25': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_mean_25},
+        'median_5': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_median_5},
+        'median_25': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_median_25},
+        'mean_total': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_total_mean},
+        'median_total': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_total_median}
+    }
+    total_relevant_docs_identified = 0
+    print("Processing documents")
+    for i, text in tqdm(enumerate(documents)):
+        sorted_similarities = similarity_func(glove_embedding, corpus_embedding, text)
+        relevance_prediction = np.mean(sorted_similarities[:5])
+
+        ground_truth_text_relevance = text in relevant_texts
+        # print(f"Relevance of {document_urls[i].ljust(max_url_length)} is: {relevance_prediction:.3f}")
+        for key, value in performance_stats.items():
+            is_relevant = relevance_prediction <= value["threshold"]
+            if is_relevant and ground_truth_text_relevance:
+                performance_stats[key]['tp'] += 1
+            elif is_relevant and not ground_truth_text_relevance:
+                performance_stats[key]['fp'] += 1
+            elif not is_relevant and ground_truth_text_relevance:
+                performance_stats[key]['fn'] += 1
+            elif not is_relevant and not ground_truth_text_relevance:
+                performance_stats[key]['tn'] += 1
+        total_relevant_docs_identified += is_relevant
+
+
+    for key, stats in performance_stats.items():
+        precision = (stats['tp'] / (stats['tp'] + stats['fp'])) if stats['tp'] + stats['fp'] > 0 else 0
+        recall = (stats['tp'] / (stats['tp'] + stats['fn'])) if stats['tp'] + stats['fn'] > 0 else 0
+        print(f"TP: {stats['tp']} - FP: {stats['fp']} - FN: {stats['fn']} - TN: {stats['tn']}")
+        print(f"{key} - Precision: {precision:.3f}, Recall: {recall:.3f}")
+    print(f"Total relevant documents found: {total_relevant_docs_identified} out of {num_relevant}. (False Positives included)")
+
+        
+def test_precision_novelty_detection(corpus_embedding, embedding_type="", glove_embedding=None):
+    def update_stats(prediction, stats, ground_truth):
+        is_relevant = False if prediction == -1 else True
+        if is_relevant and ground_truth:
+            stats['tp'] += 1
+        elif is_relevant and not ground_truth:
+            stats['fp'] += 1
+        elif not is_relevant and ground_truth:
+            stats['fn'] += 1
+        elif not is_relevant and not ground_truth:
+            stats['tn'] += 1
+
+    def print_stats(stats, title=""):
+        precision = (stats['tp'] / (stats['tp'] + stats['fp'])) if stats['tp'] + stats['fp'] > 0 else 0
+        recall = (stats['tp'] / (stats['tp'] + stats['fn'])) if stats['tp'] + stats['fn'] > 0 else 0
+        print(f"TP: {stats['tp']} - FP: {stats['fp']} - FN: {stats['fn']} - TN: {stats['tn']}")
+        print(f"{title} - Precision: {precision:.3f}, Recall: {recall:.3f}")
+
+    svm_model = OneClassSVM(kernel='rbf', gamma='auto', nu=0.01)
+    svm_model.fit(corpus_embedding)
+
+    lof_model = LocalOutlierFactor(n_neighbors=8, novelty=True)
+    lof_model.fit(corpus_embedding)
+
+    iso_model = IsolationForest(random_state=42)
+    iso_model.fit(corpus_embedding)
+
+    sgd_model = linear_model.SGDOneClassSVM(nu=0.05)
+    sgd_model.fit(corpus_embedding)
+
+    reference_corpus = filter_abstracts(return_abstracts=True)
+    relevant_texts = get_texts(relevant=True)
+    irrelevant_texts = get_texts(relevant=False)
+    num_relevant = len(relevant_texts)
+    num_irrelevant = len(irrelevant_texts)
+
+    document_urls = relevant_urls + irrelevant_urls
+    documents = relevant_texts + irrelevant_texts
+    combined = list(zip(documents, document_urls))
+    random.shuffle(combined)
+
+    unseen_documents, document_urls = zip(*combined)
+    lof_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+    svm_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+    iso_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+    sgd_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+
+    for document in tqdm(unseen_documents):
+        if embedding_type == "tfidf":
+            document_embedding  = tfidf_vectorizer.transform([document])
+        elif embedding_type == "bert":
+            document_embedding = get_bert_text_embedding(document)
+        elif embedding_type == "glove":
+            document_embedding = np.array(calc_embedding_from_tokens(glove_embedding, process_documents_combined([document]))).reshape(1, -1)
+        else:
+            print("Specify embedding type")
+            exit()
+        lof_prediction = lof_model.predict(document_embedding)[0]
+        svm_prediction = svm_model.predict(document_embedding)[0]
+        iso_prediction = iso_model.predict(document_embedding)[0]
+        sgd_prediction = sgd_model.predict(document_embedding)[0]
+
+        ground_truth = document in relevant_texts
+        update_stats(lof_prediction, lof_stats, ground_truth)
+        update_stats(svm_prediction, svm_stats, ground_truth)
+        update_stats(iso_prediction, iso_stats, ground_truth)
+        update_stats(sgd_prediction, sgd_stats, ground_truth)
+
+    print_stats(lof_stats, title="lof")
+    print_stats(svm_stats, title="svm")
+    print_stats(iso_stats, title="iso")
+    print_stats(sgd_stats, title="sgd")
 
 def main():
     # Abstract preprocessing / Visualization
@@ -667,25 +848,43 @@ def main():
     # analyze_reference_corpus("data/bert_embeddings.npy", "")
     # analyze_reference_corpus("data/filtered_bert_embeddings.npy", "_filtered")
 
-
+    for _ in range(5):
+        print("Threshold Selection approach")
+        print("TFIDF Results:")
+        test_precision_threshold(get_tfidf_of_corpus(), similarity_func=calc_similarities_tfidf)
+        glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
+        print("GloVe Results:")
+        test_precision_threshold(np.load("data/multiple_embeddings.npy"), similarity_func=calc_similarities_glove, glove_embedding=glove_embeddings)
+        print("BERT Results:")
+        test_precision_threshold(get_bert_embeddings("data/filtered_bert_embeddings.npy"), similarity_func=calc_similarities_bert)
+        
+        print("Novelty Detection Approach")
+        print("TFIDF Results:")
+        test_precision_novelty_detection(get_tfidf_of_corpus(), embedding_type="tfidf")
+        print("GloVe Results:")
+        test_precision_novelty_detection(np.load("data/multiple_embeddings.npy"), embedding_type="glove", glove_embedding=glove_embeddings)
+        print("BERT Results:")
+        test_precision_novelty_detection(get_bert_embeddings("data/filtered_bert_embeddings.npy"), embedding_type="bert")
+        print("-"*250)
+        
     # TFIDF baseline
     # print("Test TFIDF baseline: ")
     # test_tfidf_baseline_embedding()
     # print("#"*100)
     # bert based embeddings
-    print("Test BERT-based embeddings: ")
-    test_bert_embedding(get_bert_embeddings("data/filtered_bert_embeddings.npy"), euclidean_distances)
-    print("#"*100)
+    # print("Test BERT-based embeddings: ")
+    # test_bert_embedding(get_bert_embeddings("data/filtered_bert_embeddings.npy"), euclidean_distances)
+    # print("#"*100)
     # bert based embeddings, KNN 
-    print("Test BERT-based embeddings with KNN: ")
-    test_bert_embedding_knn(get_bert_embeddings("data/filtered_bert_embeddings.npy"), num_neighbors=3)
-    print("#"*100)
+    # print("Test BERT-based embeddings with KNN: ")
+    # test_bert_embedding_knn(get_bert_embeddings("data/filtered_bert_embeddings.npy"), num_neighbors=3)
+    # print("#"*100)
 
+    exit()
 
     # bert classification
     test_bert_classification()
 
-    quit()
 
 
     glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
@@ -712,15 +911,6 @@ def main():
     print("Test TFIDF weighted mean embeddings")
     test_tfidf_weighted_mean_embedding(glove_embeddings)
     print("#"*100)
-
-    
-    # one embedding for each level 1 taxonomy concept (atmosphere, disasters, land, built environment, marine, security)
-    # print("Test taxonomy embedding")
-    # test_taxonomy_embedding(glove_embeddings)
-    # print("#"*100)
-
-
-    # 
 
 
 
