@@ -679,7 +679,7 @@ def calc_similarities_bert(glove_embedding, corpus_embedding, text):
 
 def calc_similarities_tfidf(glove_embedding, corpus_tfidf, text):
     document_tfidf = tfidf_vectorizer.transform([text])
-    similarities = euclidean_distances(corpus_tfidf, document_tfidf).flatten()
+    similarities = cosine_similarity(corpus_tfidf, document_tfidf).flatten()
     sorted_similarities = np.sort(similarities)[::-1]
     return sorted_similarities
 
@@ -707,7 +707,6 @@ def test_precision_threshold(corpus_embedding, similarity_func=None, glove_embed
     top_5 = int(len(reference_corpus)*0.05)
     top_25 = int(len(reference_corpus)*0.25)
 
-    print("Determining relevance threshold")
     for i, text in tqdm(enumerate(relevant_threshold_set)):
         sorted_similarities = similarity_func(glove_embedding, corpus_embedding, text)
         sims_5.append(np.mean(sorted_similarities[:top_5]))
@@ -723,13 +722,6 @@ def test_precision_threshold(corpus_embedding, similarity_func=None, glove_embed
     relevant_threshold_total_mean = np.array(sims).mean()
     relevant_threshold_total_median = np.median(sims)
 
-    print("Thresholds:")
-    print("Mean_5:", relevant_threshold_mean_5)
-    print("Mean_25:", relevant_threshold_mean_25)
-    print("Median_5:", relevant_threshold_median_5)
-    print("Median_25:", relevant_threshold_median_25)
-    print("Mean_total:", relevant_threshold_total_mean)
-    print("Median_total:", relevant_threshold_total_median)
 
     performance_stats = {
         'mean_5': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_mean_5},
@@ -740,7 +732,6 @@ def test_precision_threshold(corpus_embedding, similarity_func=None, glove_embed
         'median_total': {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0, 'threshold':relevant_threshold_total_median}
     }
     total_relevant_docs_identified = 0
-    print("Processing documents")
     for i, text in tqdm(enumerate(documents)):
         sorted_similarities = similarity_func(glove_embedding, corpus_embedding, text)
         relevance_prediction = np.mean(sorted_similarities[:5])
@@ -767,29 +758,32 @@ def test_precision_threshold(corpus_embedding, similarity_func=None, glove_embed
         print(f"{key} - Precision: {precision:.3f}, Recall: {recall:.3f}")
     print(f"Total relevant documents found: {total_relevant_docs_identified} out of {num_relevant}. (False Positives included)")
 
-        
-def test_precision_novelty_detection(corpus_embedding, embedding_type="", glove_embedding=None):
-    def update_stats(prediction, stats, ground_truth):
-        is_relevant = False if prediction == -1 else True
-        if is_relevant and ground_truth:
-            stats['tp'] += 1
-        elif is_relevant and not ground_truth:
-            stats['fp'] += 1
-        elif not is_relevant and ground_truth:
-            stats['fn'] += 1
-        elif not is_relevant and not ground_truth:
-            stats['tn'] += 1
+    
+def update_stats(prediction, stats, ground_truth):
+    is_relevant = False if prediction == -1 else True
+    if is_relevant and ground_truth:
+        stats['tp'] += 1
+    elif is_relevant and not ground_truth:
+        stats['fp'] += 1
+    elif not is_relevant and ground_truth:
+        stats['fn'] += 1
+    elif not is_relevant and not ground_truth:
+        stats['tn'] += 1
 
-    def print_stats(stats, title=""):
-        precision = (stats['tp'] / (stats['tp'] + stats['fp'])) if stats['tp'] + stats['fp'] > 0 else 0
-        recall = (stats['tp'] / (stats['tp'] + stats['fn'])) if stats['tp'] + stats['fn'] > 0 else 0
-        print(f"TP: {stats['tp']} - FP: {stats['fp']} - FN: {stats['fn']} - TN: {stats['tn']}")
-        print(f"{title} - Precision: {precision:.3f}, Recall: {recall:.3f}")
+
+def print_stats(stats, title=""):
+    precision = (stats['tp'] / (stats['tp'] + stats['fp'])) if stats['tp'] + stats['fp'] > 0 else 0
+    recall = (stats['tp'] / (stats['tp'] + stats['fn'])) if stats['tp'] + stats['fn'] > 0 else 0
+    print(f"TP: {stats['tp']} - FP: {stats['fp']} - FN: {stats['fn']} - TN: {stats['tn']}")
+    print(f"{title} - Precision: {precision:.3f}, Recall: {recall:.3f}")
+
+
+def test_precision_novelty_detection(corpus_embedding, embedding_type="", glove_embedding=None):
 
     svm_model = OneClassSVM(kernel='rbf', gamma='auto', nu=0.01)
     svm_model.fit(corpus_embedding)
 
-    lof_model = LocalOutlierFactor(n_neighbors=8, novelty=True)
+    lof_model = LocalOutlierFactor(n_neighbors=4, novelty=True)
     lof_model.fit(corpus_embedding)
 
     iso_model = IsolationForest(random_state=42)
@@ -841,6 +835,82 @@ def test_precision_novelty_detection(corpus_embedding, embedding_type="", glove_
     print_stats(iso_stats, title="iso")
     print_stats(sgd_stats, title="sgd")
 
+def hp_search_lof():
+    corpus_embedding = get_bert_embeddings("data/filtered_bert_embeddings.npy")
+
+    relevant_texts = get_texts(relevant=True)
+    irrelevant_texts = get_texts(relevant=False)
+    document_urls = relevant_urls + irrelevant_urls
+    documents = relevant_texts + irrelevant_texts
+    combined = list(zip(documents, document_urls))
+    random.shuffle(combined)
+    unseen_documents, document_urls = zip(*combined)
+
+    n_neighbors_options = [2, 4, 8, 12, 16, 20, 40, 50, 75, 100]
+    leaf_size_options = [30, 40, 50, 200]
+
+    for leaf_size in tqdm(leaf_size_options):
+        for num_neighbor in tqdm(n_neighbors_options):
+            lof_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+            lof_model = LocalOutlierFactor(n_neighbors=num_neighbor, leaf_size=leaf_size, novelty=True)
+            lof_model.fit(corpus_embedding)
+
+            for document in tqdm(unseen_documents):
+                document_embedding = get_bert_text_embedding(document)
+                lof_prediction = lof_model.predict(document_embedding)[0]
+
+                ground_truth = document in relevant_texts
+                update_stats(lof_prediction, lof_stats, ground_truth)
+            print(f"Hyperparams: neighbors: {num_neighbor} - leaf_size: {leaf_size}")
+            print_stats(lof_stats, title="lof")
+
+def hp_search_iso():
+    corpus_embedding = get_bert_embeddings("data/filtered_bert_embeddings.npy")
+
+    relevant_texts = get_texts(relevant=True)
+    irrelevant_texts = get_texts(relevant=False)
+    document_urls = relevant_urls + irrelevant_urls
+    documents = relevant_texts + irrelevant_texts
+    combined = list(zip(documents, document_urls))
+    random.shuffle(combined)
+    unseen_documents, document_urls = zip(*combined)
+
+    n_estimators_options = [10, 50, 100, 200, 300, 400, 500, 700, 1000]
+
+    for num_estimators in tqdm(n_estimators_options):
+        lof_stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+
+        iso_model = IsolationForest(random_state=42, n_estimators=num_estimators)
+        iso_model.fit(corpus_embedding)
+
+        for document in tqdm(unseen_documents):
+            document_embedding = get_bert_text_embedding(document)
+            lof_prediction = iso_model.predict(document_embedding)[0]
+
+            ground_truth = document in relevant_texts
+            update_stats(lof_prediction, lof_stats, ground_truth)
+        print(f"Hyperparams: estimators: {num_estimators}")
+        print_stats(lof_stats, title="iso")
+
+def random_benchmark():
+    relevant_texts = get_texts(relevant=True)
+    irrelevant_texts = get_texts(relevant=False)
+    document_urls = relevant_urls + irrelevant_urls
+    documents = relevant_texts + irrelevant_texts
+    combined = list(zip(documents, document_urls))
+    random.shuffle(combined)
+    unseen_documents, document_urls = zip(*combined)
+
+    stats = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
+    model_predict = lambda: random.choice([-1, 1])
+
+    for document in tqdm(unseen_documents):
+        prediction = model_predict()
+        ground_truth = document in relevant_texts
+        update_stats(prediction, stats, ground_truth)
+
+    print_stats(stats, title="random")
+
 def main():
     # Abstract preprocessing / Visualization
     # filter_abstracts()
@@ -849,24 +919,30 @@ def main():
     # analyze_reference_corpus("data/filtered_bert_embeddings.npy", "_filtered")
 
     for _ in range(5):
-        print("Threshold Selection approach")
-        print("TFIDF Results:")
-        test_precision_threshold(get_tfidf_of_corpus(), similarity_func=calc_similarities_tfidf)
-        glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
-        print("GloVe Results:")
-        test_precision_threshold(np.load("data/multiple_embeddings.npy"), similarity_func=calc_similarities_glove, glove_embedding=glove_embeddings)
-        print("BERT Results:")
-        test_precision_threshold(get_bert_embeddings("data/filtered_bert_embeddings.npy"), similarity_func=calc_similarities_bert)
+        random_benchmark()
+
+    # glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
+    # for _ in range(1):
+    #     print("Threshold Selection approach")
+    #     print("TFIDF Results:")
+    #     test_precision_threshold(get_tfidf_of_corpus(), similarity_func=calc_similarities_tfidf)
+    #     print("GloVe Results:")
+    #     test_precision_threshold(np.load("data/multiple_embeddings.npy"), similarity_func=calc_similarities_glove, glove_embedding=glove_embeddings)
+    #     print("BERT Results:")
+    #     test_precision_threshold(get_bert_embeddings("data/filtered_bert_embeddings.npy"), similarity_func=calc_similarities_bert)
+    #     
+    #     print("Novelty Detection Approach")
+    #     print("TFIDF Results:")
+    #     test_precision_novelty_detection(get_tfidf_of_corpus(), embedding_type="tfidf")
+    #     print("GloVe Results:")
+    #     test_precision_novelty_detection(np.load("data/multiple_embeddings.npy"), embedding_type="glove", glove_embedding=glove_embeddings)
+    #     print("BERT Results:")
+    #     test_precision_novelty_detection(get_bert_embeddings("data/filtered_bert_embeddings.npy"), embedding_type="bert")
+    #     print("-"*250)
         
-        print("Novelty Detection Approach")
-        print("TFIDF Results:")
-        test_precision_novelty_detection(get_tfidf_of_corpus(), embedding_type="tfidf")
-        print("GloVe Results:")
-        test_precision_novelty_detection(np.load("data/multiple_embeddings.npy"), embedding_type="glove", glove_embedding=glove_embeddings)
-        print("BERT Results:")
-        test_precision_novelty_detection(get_bert_embeddings("data/filtered_bert_embeddings.npy"), embedding_type="bert")
-        print("-"*250)
-        
+    # hp_search_iso()
+    # hp_search_lof()
+
     # TFIDF baseline
     # print("Test TFIDF baseline: ")
     # test_tfidf_baseline_embedding()
