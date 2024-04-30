@@ -1,11 +1,28 @@
 import requests
 import urllib.robotparser
 import urllib
+import json
+import re
+import hashlib
+import torch
+import os
+import httpx
+import numpy as np
+import h5py
 
 from bs4 import BeautifulSoup
 from requests_html import HTMLSession
-from httpx import Client
+from boilerpy3 import extractors
+from transformers import BertTokenizer, BertModel
+from collections import defaultdict, Counter
+from urllib.parse import urljoin, urlparse
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+bert_model = BertModel.from_pretrained('bert-base-uncased')
+bert_model.eval()
 
 def is_crawlable(url):
     try:
@@ -30,8 +47,12 @@ def is_valid_mime_type(url):
             return False
     return True
 
-def get_search_engine_seeds():
-    pass
+def fetch_search_engine_seeds(query):
+    links = []
+    links.extend(fetch_bing_links(query))
+    links.extend(fetch_google_links(query))
+    # links.extend(fetch_ecosia_links(query))
+    return links
 
 def fetch_google_links(query):
     # has to be valid header and cookie
@@ -63,7 +84,7 @@ def fetch_google_links(query):
         'q': query,  
         'hl': 'en',             
         'gl': 'us',             
-        'num': '50'             
+        'num': '500'             
     }
 
     try:
@@ -153,7 +174,7 @@ def fetch_ecosia_links(query):
         'method': 'index',
         'hl': 'en',             
         'gl': 'us',             
-        'num': '50'             
+        'num': '500'             
     }
     try:
         session = HTMLSession()
@@ -168,28 +189,252 @@ def fetch_ecosia_links(query):
 
     return 
 
+
+def fetch_openalex_links(query):
+    base_url = "https://api.openalex.org"
+
+    def get_concept_id(query):
+        response = requests.get(f"{base_url}/concepts", params={"filter": f"display_name.search:{query}"})
+        data = response.json()
+        for concept in data['results']:
+            if query.lower() in concept['display_name'].lower():
+                return concept['id']
+        return None
+
+    def get_works_by_concept(concept_id):
+        response = requests.get(f"{base_url}/works", params={"filter": f"concepts.id:{concept_id}"})
+        return response.json()
+
+    concept_id = get_concept_id(query)
+    if concept_id:
+        works = get_works_by_concept(concept_id)    
+        results = works["results"]
+        links = []
+        for result in results:
+            links.append(result["doi"])
+        return links
+    else:
+        print(f"Concept ID not found for {query}")
+
+
+def fetch_doaj_links(query):
+    url = f"https://doaj.org/api/search/articles/{query.replace(' ', '%20')}?pageSize=100"
+    response = requests.get(url)
+    results = response.json()["results"]
+    with open("doaj.json", "w+") as file:
+        json.dump(response.json(), file, indent=4)
+    links = []
+    for result in results:
+        if "bibjson" in result:
+            languages = result["bibjson"]["journal"]["language"]
+            if len(languages) > 1:
+                continue
+            links.append(result["bibjson"]["link"][0]["url"])
+    return links
+
+def get_reference_corpus(urls, chunked=True):
+    def chunk_up_text(text, chunk_size=512):
+        split_text = text.split(" ")
+        chunked_text = [" ".join(split_text[i:i+chunk_size]) for i in range(0, len(split_text), chunk_size)]
+        return chunked_text
+
+    def clean_text(text):
+        #remove urls
+        text = re.sub(r'http[s]?://\S+', '', text)
+        text = re.sub(r'\S*\.com\S*', '', text)
+        text = re.sub(r'\S*www\.\S*', '', text)
+
+        #remove citation
+        text = re.sub(r'\([\w\s,.&;-]+(\d{4})\)', '', text)
+
+        #remove special chars
+        text = re.sub(r'[^a-zA-Z\s]', '', text)
+
+        #remove latex stuff
+        text = re.sub(r'\$.*?\$', '', text)
+        text = re.sub(r'\$\$(.*?)\$\$', '', text)
+        text = re.sub(r'\\\(.*?\\\)', '', text)
+        text = re.sub(r'\\\[(.*?)\\\]', '', text)
+
+        #remove figure/table headers
+        text = re.sub(r'(Figure|Table|FIGURE|TABLE|Fig|Tab) \d+', '', text)
+
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+        
+    extractor = extractors.ArticleExtractor()
+    raw_documents = []
+    for url in urls:
+        try:
+            document = extractor.get_doc_from_url(url)
+            text = document.content
+            blocks = document.text_blocks
+        except:
+            print(f"not allowed to crawl {url}")
+            continue
+        raw_documents.append(text)
+    
+    documents = [clean_text(doc) for doc in raw_documents]
+    if chunked:
+        chunked_document = []
+        chunk_size = 512
+        for doc in documents:
+            text_chunks = chunk_up_text(doc)
+            for text in text_chunks:
+                if len(text) > chunk_size//2:
+                    chunked_document.append(text)
+        return chunked_document
+    return documents
+
+def get_bert_text_embedding(document, cache_file="bert_embeddings_webdata.json"):
+    doc_hash = hashlib.sha256(document.encode('utf-8')).hexdigest()
+    
+    if os.path.exists(cache_file):
+        with open(cache_file, 'r') as f:
+            cache = json.load(f)
+    else:
+        cache = {}
+
+    if doc_hash in cache:
+        cached_embedding = torch.tensor(cache[doc_hash])
+        return cached_embedding
+    else:
+        inputs = bert_tokenizer(document, return_tensors='pt', truncation=True, max_length=512, padding="max_length")
+        outputs = bert_model(**inputs)
+        embeddings = outputs.last_hidden_state.mean(1)
+        
+        with open(cache_file, 'w') as f:
+            cache[doc_hash] = embeddings.detach().numpy().tolist()
+            json.dump(cache, f)
+        
+        return embeddings
+    
+
+def execute_HITS(seed_urls, cached_graph="cache.json", max_iter=20, N=10, depth=0):
+    def fetch_url(url, session):
+        try:
+            response = session.get(url, timeout=10)
+            response.raise_for_status()
+            links = {urlparse(link).geturl() for link in response.html.absolute_links}
+            return url, links
+        except httpx.RequestError as e:
+            print(f"Error fetching {url}: {str(e)}")
+            return url, set()
+        
+    def create_web_graph(seed_urls):
+        if os.path.exists(cached_graph):
+            with open(cached_graph, 'r') as file:
+                data = json.load(file)
+            graph = {k: set(v) for k, v in data.items()}
+        else:
+            graph = defaultdict(set)
+            for i in range(depth+1):
+                print(f"Depth {i}; Crawling: {len(seed_urls)}")
+                with HTMLSession() as session:
+                    with ThreadPoolExecutor(max_workers=50) as executor:
+                        future_to_url = {executor.submit(fetch_url, url, session):url for url in seed_urls}
+                        child_urls = []
+                        for future in tqdm(as_completed(future_to_url)):
+                            url = future_to_url[future]
+                            try:
+                                url, links = future.result()
+                                graph[url] |= links
+                                child_urls.extend(links)
+                            except Exception as e:
+                                print(f"Error processing {url}: {str(e)}")
+
+                seed_urls = child_urls
+            json_graph = {k: list(v) for k, v in graph.items()}
+            with open(cached_graph, 'w+') as file:
+                json.dump(json_graph, file, indent=4)
+        return graph
+    
+    graph = create_web_graph(seed_urls)
+
+    pages = list(graph.keys())
+    num_pages = len(pages)
+    
+    hubs = {page: 1.0 for page in pages}
+    authorities = {page: 1.0 for page in pages}
+    
+    for _ in range(max_iter):
+        old_hubs = hubs.copy()
+        old_authorities = authorities.copy()
+        
+        authority_updates = Counter()
+        for page in pages:
+            for linked_page in graph[page]:
+                if linked_page in authorities:
+                    authority_updates[linked_page] += old_hubs[page]
+        
+        for page in pages:
+            authorities[page] = authority_updates[page]
+
+        hub_updates = Counter()
+        for page in pages:
+            for linked_page in graph[page]:
+                if linked_page in authorities:
+                    hub_updates[page] += authorities[linked_page]
+
+        for page in pages:
+            hubs[page] = hub_updates[page]
+
+        norm = sum(authorities.values())**0.5
+        authorities = {page: val / norm for page, val in authorities.items()}
+        
+        norm = sum(hubs.values())**0.5
+        hubs = {page: val / norm for page, val in hubs.items()}
+
+
+    top_n_hubs = sorted(hubs.items(), key=lambda x: x[1], reverse=True)[:N]
+    top_n_authorities = sorted(authorities.items(), key=lambda x: x[1], reverse=True)[:N]
+    
+
+    # print("TOP HUBS", "@"*50)
+    # print(top_n_hubs)
+
+    # print("TOP AUTHS", "@"*50)
+    # print(top_n_authorities)
+
+    return hubs, authorities, top_n_hubs, top_n_authorities
+
+
 def main():
     query = "earth observation"
-    seed_urls = []
-    print("Fetching links from Google:")
-    google_links = fetch_google_links(query)
-    for link in google_links:
-        print(link)
-        seed_urls.append(link)
-
-    print("\nFetching links from Bing:")
-    bing_links = fetch_bing_links(query)
-    for link in bing_links:
-        print(link)
-        seed_urls.append(link)
-
-    # TODO
-    # print("\nFetching links from Ecosia:")
-    # ecosia_links = fetch_ecosia_links(query)
-    # for link in ecosia_links:
-    #     print(link)
-
+    if os.path.exists(f"seeds_{query.replace(' ', '_')}.txt"):
+        with open(f"seeds_{query.replace(' ', '_')}.txt", "r") as file:
+            seed_urls = [url.strip() for url in file]
+    else:
+        potential_urls = []
+        potential_urls.extend(fetch_doaj_links(query))
+        potential_urls.extend(fetch_openalex_links(query))
+        potential_urls.extend(fetch_search_engine_seeds(query))
+        potential_urls = [url for url in tqdm(potential_urls) if is_crawlable(url)]
+        seed_urls = set(potential_urls)
+        with open(f"seeds_{query.replace(' ', '_')}.txt", "w+") as file:
+            for link in seed_urls:
+                file.write(link+"\n")
+    print("Num Seeds:", len(seed_urls))
+    depth = 0
+    hub, auth, top_hub, top_auth = execute_HITS(seed_urls, cached_graph=f"graph_{query.replace(' ', '_')}_depth_{depth}.json", depth=depth, N=250)
     
+    print(len(hub), len(auth), len(top_hub), len(top_auth))
+    with open(f"seeds_depth_{depth}.txt", "w+") as file:
+        seed_urls = [x[0] for x in top_auth] + [x[0] for x in top_hub]
+        for seed in seed_urls:
+            file.write(seed+"\n")
+
+    corpus_urls = [x[0] for x in top_auth] if depth > 0 else seed_urls
+
+    reference_documents = get_reference_corpus(corpus_urls)
+    with open(f"reference_documents_{query.replace(' ', '_')}.txt", "w+") as file:
+        for doc in reference_documents:
+            file.write(doc+"\n")
+
+    with h5py.File(f"../Embedding/data/corpus_embedding_d_{depth}.hdf5", 'w') as hdf5_file:
+        for idx, doc in enumerate(tqdm(reference_documents)):
+            embedding = get_bert_text_embedding(doc).detach().numpy()
+            hdf5_file.create_dataset(f'embedding_{idx}', data=embedding, compression='gzip')
 
 if __name__ == "__main__":
     main()
@@ -212,7 +457,7 @@ if __name__ == "__main__":
 #   -H "sec-ch-ua-wow64: ?0" ^
 #   -H "sec-fetch-dest: document" ^
 #   -H "sec-fetch-mode: navigate" ^
-#   -H "sec-fetch-site: same-origin" ^
+#   -H "sec-fetch-site: same-origin" 
 #   -H "sec-fetch-user: ?1" ^
 #   -H "upgrade-insecure-requests: 1" ^
 #   -H "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0"

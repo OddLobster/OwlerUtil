@@ -1,1 +1,6 @@
 Embedding/data
+Embedding/*.png
+SeedGathering/*.txt
+SeedGathering/*.json
+SeedGathering/*.npy
+SeedGathering/*.html

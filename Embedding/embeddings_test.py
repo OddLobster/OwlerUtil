@@ -10,6 +10,7 @@ import seaborn as sns
 import time
 import random
 import hashlib
+import h5py
 
 from sklearn.manifold import TSNE
 from numpy.linalg import norm
@@ -62,8 +63,8 @@ all_urls = relevant_urls + irrelevant_urls
 max_url_length = max(len(url) for url in all_urls)  
 # bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 # bert_model = BertModel.from_pretrained('bert-base-uncased')
-bert_tokenizer = BertTokenizer.from_pretrained('bert-large-uncased')
-bert_model = BertModel.from_pretrained('bert-large-uncased')
+bert_tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+bert_model = BertModel.from_pretrained('bert-base-uncased')
 bert_model.eval()
 
 tfidf_vectorizer = TfidfVectorizer(max_df=0.8, min_df=0.05)
@@ -377,11 +378,18 @@ def get_bert_text_embedding(document, cache_file="data/bert_embeddings_cache_lar
             cache[doc_hash] = embeddings.detach().numpy().tolist()
             json.dump(cache, f)
         
-        return embeddings
+        return embeddings.detach()
     
 
 def get_bert_embeddings(embedding_file=None, abstracts=None):
-
+    if ".hdf5" in embedding_file:
+        with h5py.File(embedding_file, 'r') as hdf5_file:
+            embeddings = []
+            for key in hdf5_file.keys():
+                embeddings.append(np.array(hdf5_file[key]))
+            embeddings = np.array(embeddings).squeeze(1)
+            print(embeddings.shape)
+        return embeddings
     if not embedding_file:
         embedding_file = "data/bert_embeddings.npy"
     if not os.path.exists(embedding_file):
@@ -392,6 +400,7 @@ def get_bert_embeddings(embedding_file=None, abstracts=None):
         np.save(embedding_file, corpus_embedding)
     else:
         corpus_embedding = np.load(embedding_file)
+        print(corpus_embedding.shape)
     
     return corpus_embedding
 
@@ -794,7 +803,6 @@ def test_precision_novelty_detection(corpus_embedding, embedding_type="", glove_
     sgd_model = linear_model.SGDOneClassSVM(nu=0.05)
     sgd_model.fit(corpus_embedding)
 
-    reference_corpus = filter_abstracts(return_abstracts=True)
     relevant_texts = get_texts(relevant=True)
     irrelevant_texts = get_texts(relevant=False)
     num_relevant = len(relevant_texts)
@@ -923,27 +931,27 @@ def main():
     for _ in range(5):
         random_benchmark()
 
-    # glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
-    # for _ in range(1):
-    #     print("Threshold Selection approach")
-    #     print("TFIDF Results:")
-    #     test_precision_threshold(get_tfidf_of_corpus(), similarity_func=calc_similarities_tfidf)
-    #     print("GloVe Results:")
-    #     test_precision_threshold(np.load("data/multiple_embeddings.npy"), similarity_func=calc_similarities_glove, glove_embedding=glove_embeddings)
-    #     print("BERT Results:")
-    #     test_precision_threshold(get_bert_embeddings("data/filtered_bert_embeddings.npy"), similarity_func=calc_similarities_bert)
-    #     
-    #     print("Novelty Detection Approach")
-    #     print("TFIDF Results:")
-    #     test_precision_novelty_detection(get_tfidf_of_corpus(), embedding_type="tfidf")
-    #     print("GloVe Results:")
-    #     test_precision_novelty_detection(np.load("data/multiple_embeddings.npy"), embedding_type="glove", glove_embedding=glove_embeddings)
-    #     print("BERT Results:")
-    #     test_precision_novelty_detection(get_bert_embeddings("data/filtered_bert_embeddings.npy"), embedding_type="bert")
-    #     print("-"*250)
+    #glove_embeddings = load_glove_model("data/glove.42B.300d/glove.42B.300d.txt")
+    for _ in range(1):
+        print("Threshold Selection approach")
+        # print("TFIDF Results:")
+        # test_precision_threshold(get_tfidf_of_corpus(), similarity_func=calc_similarities_tfidf)
+        # print("GloVe Results:")
+        # test_precision_threshold(np.load("data/multiple_embeddings.npy"), similarity_func=calc_similarities_glove, glove_embedding=glove_embeddings)
+        # print("BERT Results:")
+        # test_precision_threshold(get_bert_embeddings("data/corpus_embedding_d_0.hdf5"), similarity_func=calc_similarities_bert)
+        
+        print("Novelty Detection Approach")
+        # print("TFIDF Results:")
+        # test_precision_novelty_detection(get_tfidf_of_corpus(), embedding_type="tfidf")
+        # print("GloVe Results:")
+        # test_precision_novelty_detection(np.load("data/multiple_embeddings.npy"), embedding_type="glove", glove_embedding=glove_embeddings)
+        print("BERT Results:")
+        test_precision_novelty_detection(get_bert_embeddings("data/corpus_embedding_d_0.hdf5"), embedding_type="bert")
+        print("-"*250)
         
     # hp_search_iso()
-    hp_search_lof()
+    # hp_search_lof()
 
     # TFIDF baseline
     # print("Test TFIDF baseline: ")
@@ -951,7 +959,7 @@ def main():
     # print("#"*100)
     # bert based embeddings
     print("Test BERT-based embeddings: ")
-    test_bert_embedding(get_bert_embeddings("data/filtered_bert_embeddings_large.npy"), euclidean_distances)
+    test_bert_embedding(get_bert_embeddings("data/corpus_embedding_d_0.hdf5"), euclidean_distances)
     print("#"*100)
     # bert based embeddings, KNN 
     # print("Test BERT-based embeddings with KNN: ")
