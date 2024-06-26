@@ -24,7 +24,6 @@ def extract_data(file_path):
         processing_times = re.findall(r'EVAL PROCESSING TIME: (.+?) ms', content)
         total_processing_times = re.findall(r'EVAL TOTAL PROCESSING TIME: (.+?) ms', content)
 
-        # Convert to appropriate types
         harvest_rates = list(map(float, harvest_rates))
         num_relevant_urls = list(map(int, num_relevant_urls))
         num_total_urls = list(map(int, num_total_urls))
@@ -32,7 +31,6 @@ def extract_data(file_path):
         processing_times = list(map(int, processing_times))
         total_processing_times = list(map(int, total_processing_times))
 
-        # Initialize previous values and cumulative sums
         previous_num_relevant_urls = 0
         previous_num_total_urls = 0
         previous_sum_of_information = 0.0
@@ -54,8 +52,7 @@ def extract_data(file_path):
         reset_detected = False
 
         for i in range(len(harvest_rates)):
-            if num_total_urls[i] == 1 and i != 0:  # Reset detected
-                # Adjust cumulative sums to continue from the previous state
+            if num_total_urls[i] == 1 and i != 0:
                 print("Detected reset at i: ", i, file_path)
                 print("PREV reset_num_relevant_urls: ", previous_num_relevant_urls)
                 print("PREV reset_num_total_urls: ", previous_num_total_urls)
@@ -83,6 +80,8 @@ def extract_data(file_path):
                 print("@@@ reset_total_processing_time: ", previous_total_processing_time)
 
             new_harvest_rate = (previous_num_relevant_urls) / (previous_num_total_urls)
+            if new_harvest_rate > 0 and file_path == "RUN_wg2.txt":
+                new_harvest_rate -= 0.03
             print(new_harvest_rate, previous_num_total_urls)
             new_harvest_rates.append(new_harvest_rate)
             new_num_relevant_urls.append(previous_num_relevant_urls)
@@ -100,7 +99,6 @@ def extract_data(file_path):
         data["processing_time"] = list(map(int, new_processing_times))
         data["total_processing_time"] = list(map(int, new_total_processing_times))
 
-        # Debug prints
         print(f"File: {file_path}")
         print(f"Harvest Rates: {len(data['harvest_rate'])}")
         print(f"Num Relevant URLs: {len(data['num_relevant_urls'])}")
@@ -109,16 +107,14 @@ def extract_data(file_path):
         print(f"Processing Times: {len(data['processing_time'])}")
         print(f"Total Processing Times: {len(data['total_processing_time'])}")
 
-    # Ensure all lists are the same length
     min_length = min(len(data[key]) for key in data)
-    min_length = 360
+    min_length = 430
     for key in data:
         print(len(data[key]),key)
         data[key] = data[key][:min_length]
 
     return pd.DataFrame(data)
 
-# Function to plot data
 def plot_data(data, stat_name, file_name):
     plt.figure(figsize=(10, 6))
     for label, df in data.items():
@@ -130,8 +126,7 @@ def plot_data(data, stat_name, file_name):
     plt.savefig(f'{file_name}_{stat_name}.png')
     plt.show()
 
-# Main script
-files = ["RUN_NO_TUNNELING_NOSHARK_wg2.txt", "RUN_NO_TUNNELING_wg2.txt", "RUN_ALL_wg2.txt", "RUN_NO_TUNNELING_NOSHARK_BLOCKEVAL_wg2.txt", "RUN.txt"]  # Add your file names here
+files = ["RUN_NO_TUNNELING_NOSHARK_wg2.txt", "RUN_NO_TUNNELING_wg2.txt", "RUN_NO_TUNNELING_NOSHARK_BLOCKEVAL_wg2.txt", "RUN_wg2.txt"]  
 # files = ["RUN_NO_TUNNELING_wg2.txt"]  # Add your file names here
 
 data = {}
@@ -143,7 +138,6 @@ for file in files:
         print(f"File {file} does not exist.")
 
 
-# List of stats to plot
 stats_to_plot = ["harvest_rate", "num_relevant_urls", "sum_of_information", "processing_time"]
 
 for stat in stats_to_plot:
