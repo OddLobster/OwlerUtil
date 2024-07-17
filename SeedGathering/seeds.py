@@ -34,7 +34,7 @@ def is_crawlable(url):
         crawlable = robot_parser.can_fetch("*", url)
     except Exception as e:
         print(e)
-        return False 
+        return False
     # return True
     return crawlable
 
@@ -81,10 +81,10 @@ def fetch_google_links(query):
     }
 
     params = {
-        'q': query,  
-        'hl': 'en',             
-        'gl': 'us',             
-        'num': '500'             
+        'q': query,
+        'hl': 'en',
+        'gl': 'us',
+        'num': '500'
     }
 
     try:
@@ -93,7 +93,7 @@ def fetch_google_links(query):
     except Exception as e:
         print(e)
         return None
-    
+
     initial_urls = list(response.html.absolute_links)#[:25]
     filtered_urls = [x for x in initial_urls if "google" not in x]
     seed_urls = [x for x in filtered_urls if is_crawlable(x) and is_valid_mime_type(x)]
@@ -127,10 +127,10 @@ def fetch_bing_links(query):
         "Referrer-Policy": "strict-origin-when-cross-origin"
     }
     params = {
-        'q': query,  
-        'hl': 'en',             
-        'gl': 'us',             
-        'num': '500'             
+        'q': query,
+        'hl': 'en',
+        'gl': 'us',
+        'num': '500'
     }
     try:
         session = HTMLSession()
@@ -140,7 +140,7 @@ def fetch_bing_links(query):
         print(e)
         return None
     soup = BeautifulSoup(response.text, 'html.parser')
-        
+
     cite_tags = soup.find_all('cite')
     cite_contents = [cite.get_text() for cite in cite_tags]
     seed_urls = [x for x in cite_contents if is_crawlable(x) and is_valid_mime_type(x)]
@@ -172,9 +172,9 @@ def fetch_ecosia_links(query):
     params = {
         'q': query,
         'method': 'index',
-        'hl': 'en',             
-        'gl': 'us',             
-        'num': '500'             
+        'hl': 'en',
+        'gl': 'us',
+        'num': '500'
     }
     try:
         session = HTMLSession()
@@ -183,11 +183,11 @@ def fetch_ecosia_links(query):
     except Exception as e:
         print(e)
         return None
-    
+
     with open("ecosia.html", "w+") as file:
         file.write(response.text)
 
-    return 
+    return
 
 
 def fetch_openalex_links(query):
@@ -207,7 +207,7 @@ def fetch_openalex_links(query):
 
     concept_id = get_concept_id(query)
     if concept_id:
-        works = get_works_by_concept(concept_id)    
+        works = get_works_by_concept(concept_id)
         results = works["results"]
         links = []
         for result in results:
@@ -261,7 +261,7 @@ def get_reference_corpus(urls, chunked=True):
 
         text = re.sub(r'\s+', ' ', text).strip()
         return text
-        
+
     extractor = extractors.ArticleExtractor()
     raw_documents = []
     for url in urls:
@@ -273,7 +273,7 @@ def get_reference_corpus(urls, chunked=True):
             print(f"not allowed to crawl {url}")
             continue
         raw_documents.append(text)
-    
+
     documents = [clean_text(doc) for doc in raw_documents]
     if chunked:
         chunked_document = []
@@ -288,7 +288,7 @@ def get_reference_corpus(urls, chunked=True):
 
 def get_bert_text_embedding(document, cache_file="bert_embeddings_webdata.json"):
     doc_hash = hashlib.sha256(document.encode('utf-8')).hexdigest()
-    
+
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cache = json.load(f)
@@ -302,13 +302,13 @@ def get_bert_text_embedding(document, cache_file="bert_embeddings_webdata.json")
         inputs = bert_tokenizer(document, return_tensors='pt', truncation=True, max_length=512, padding="max_length")
         outputs = bert_model(**inputs)
         embeddings = outputs.last_hidden_state.mean(1)
-        
+
         with open(cache_file, 'w') as f:
             cache[doc_hash] = embeddings.detach().numpy().tolist()
             json.dump(cache, f)
-        
+
         return embeddings
-    
+
 
 def execute_HITS(seed_urls, cached_graph="cache.json", max_iter=20, N=10, depth=0):
     def fetch_url(url, session):
@@ -320,7 +320,7 @@ def execute_HITS(seed_urls, cached_graph="cache.json", max_iter=20, N=10, depth=
         except httpx.RequestError as e:
             print(f"Error fetching {url}: {str(e)}")
             return url, set()
-        
+
     def create_web_graph(seed_urls):
         if os.path.exists(cached_graph):
             with open(cached_graph, 'r') as file:
@@ -348,25 +348,25 @@ def execute_HITS(seed_urls, cached_graph="cache.json", max_iter=20, N=10, depth=
             with open(cached_graph, 'w+') as file:
                 json.dump(json_graph, file, indent=4)
         return graph
-    
+
     graph = create_web_graph(seed_urls)
 
     pages = list(graph.keys())
     num_pages = len(pages)
-    
+
     hubs = {page: 1.0 for page in pages}
     authorities = {page: 1.0 for page in pages}
-    
+
     for _ in range(max_iter):
         old_hubs = hubs.copy()
         old_authorities = authorities.copy()
-        
+
         authority_updates = Counter()
         for page in pages:
             for linked_page in graph[page]:
                 if linked_page in authorities:
                     authority_updates[linked_page] += old_hubs[page]
-        
+
         for page in pages:
             authorities[page] = authority_updates[page]
 
@@ -381,14 +381,14 @@ def execute_HITS(seed_urls, cached_graph="cache.json", max_iter=20, N=10, depth=
 
         norm = sum(authorities.values())**0.5
         authorities = {page: val / norm for page, val in authorities.items()}
-        
+
         norm = sum(hubs.values())**0.5
         hubs = {page: val / norm for page, val in hubs.items()}
 
 
     top_n_hubs = sorted(hubs.items(), key=lambda x: x[1], reverse=True)[:N]
     top_n_authorities = sorted(authorities.items(), key=lambda x: x[1], reverse=True)[:N]
-    
+
 
     # print("TOP HUBS", "@"*50)
     # print(top_n_hubs)
@@ -417,7 +417,7 @@ def main():
     print("Num Seeds:", len(seed_urls))
     depth = 0
     hub, auth, top_hub, top_auth = execute_HITS(seed_urls, cached_graph=f"graph_{query.replace(' ', '_')}_depth_{depth}.json", depth=depth, N=250)
-    
+
     print(len(hub), len(auth), len(top_hub), len(top_auth))
     with open(f"seeds_depth_{depth}.txt", "w+") as file:
         seed_urls = [x[0] for x in top_auth] + [x[0] for x in top_hub]
@@ -431,7 +431,7 @@ def main():
         for doc in reference_documents:
             file.write(doc+"\n")
 
-    with h5py.File(f"../Embedding/data/corpus_embedding_d_{depth}.hdf5", 'w') as hdf5_file:
+    with h5py.File(f"corpus_embedding_d_{depth}.hdf5", 'w') as hdf5_file:
         for idx, doc in enumerate(tqdm(reference_documents)):
             embedding = get_bert_text_embedding(doc).detach().numpy()
             hdf5_file.create_dataset(f'embedding_{idx}', data=embedding, compression='gzip')
@@ -457,7 +457,7 @@ if __name__ == "__main__":
 #   -H "sec-ch-ua-wow64: ?0" ^
 #   -H "sec-fetch-dest: document" ^
 #   -H "sec-fetch-mode: navigate" ^
-#   -H "sec-fetch-site: same-origin" 
+#   -H "sec-fetch-site: same-origin"
 #   -H "sec-fetch-user: ?1" ^
 #   -H "upgrade-insecure-requests: 1" ^
 #   -H "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0"
