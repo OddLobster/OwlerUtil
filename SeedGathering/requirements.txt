@@ -1,0 +1,11 @@
+requests
+httpx
+numpy
+h5py
+beautifulsoup4
+requests-html
+boilerpy3
+transformers
+torch
+tqdm
+lxml_html_clean
